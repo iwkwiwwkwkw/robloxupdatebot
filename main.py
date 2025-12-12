@@ -1,150 +1,204 @@
-import discord
+ import discord
 from discord import app_commands
 import asyncio
 import aiohttp
 import os
 from keep_alive import keep_alive
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = 1447166033746989119
 
-GAME_IDS = [
-    3719762683,
-    137594107439804,
-    4079902982,
-    17573622029
+# ------------------------------
+# Games to monitor
+# ------------------------------
+GAMES = [
+    3719762683,      # Bee Swarm Simulator
+    137594107439804, # Buzz
+    4079902982,      # Bee Swarm Test Realm
+    17573622029      # Buzz 2024 (original name preserved)
 ]
+
+# ------------------------------
+# Roblox groups to monitor
+# ------------------------------
+GROUPS = {
+    5211428: "Testing Group",        # Notifications for new members
+    9760527: "Studio Developer Group" # Notifications for new developers
+}
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+# ------------------------------
+# Store state
+# ------------------------------
 last_updates = {}
+daily_update_count = {}
+last_group_members = {}
 
 # ------------------------------
-# TIME CONVERSION (UTC → CT, PRETTY)
+# Utility: convert UTC → Central Time
 # ------------------------------
-def convert_time_pretty(utc_time):
-    if not utc_time:
+def convert_to_central(utc_str):
+    if not utc_str:
         return "Unknown"
-
-    utc_dt = datetime.fromisoformat(utc_time.replace("Z", "+00:00"))
-    central = pytz.timezone("America/Chicago")
-    ct_dt = utc_dt.astimezone(central)
-
-    return ct_dt.strftime("%B %d, %Y – %I:%M %p CT")
+    utc = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+    central = utc.astimezone(pytz.timezone("America/Chicago"))
+    return central.strftime("%A, %B %d, %Y at %I:%M %p CT")
 
 # ------------------------------
-# API FUNCTIONS
+# Roblox API functions
 # ------------------------------
 async def fetch_universe_id(session, place_id):
     url = f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
-    async with session.get(url) as response:
-        data = await response.json()
+    async with session.get(url) as resp:
+        data = await resp.json()
         return data.get("universeId")
 
 async def fetch_game_info(session, universe_id):
     url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
-    async with session.get(url) as response:
-        data = await response.json()
+    async with session.get(url) as resp:
+        data = await resp.json()
         if "data" in data and len(data["data"]) > 0:
             return data["data"][0]
         return None
 
+async def fetch_group_info(session, group_id):
+    url = f"https://groups.roblox.com/v1/groups/{group_id}"
+    async with session.get(url) as resp:
+        data = await resp.json()
+        return data
+
+async def fetch_group_members(session, group_id):
+    url = f"https://groups.roblox.com/v1/groups/{group_id}/users?sortOrder=Asc&limit=100"
+    async with session.get(url) as resp:
+        data = await resp.json()
+        if "data" in data:
+            return [member["userId"] for member in data["data"]]
+        return []
+
 # ------------------------------
-# BACKGROUND CHECKER
+# Background checker
 # ------------------------------
-async def check_updates():
+async def background_task():
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
 
+    # Daily reset tracking
+    last_reset = datetime.now(pytz.timezone("America/Chicago")).date()
+
     async with aiohttp.ClientSession() as session:
         while not client.is_closed():
-            for place_id in GAME_IDS:
+            now_ct = datetime.now(pytz.timezone("America/Chicago"))
+            today = now_ct.date()
+
+            # Reset daily counts at 12 AM CT
+            if today != last_reset:
+                daily_update_count.clear()
+                last_reset = today
+
+            # ---- Game Updates ----
+            for place_id in GAMES:
                 try:
                     universe_id = await fetch_universe_id(session, place_id)
                     if not universe_id:
                         continue
-
                     info = await fetch_game_info(session, universe_id)
                     if not info:
                         continue
-
                     updated = info.get("updated")
-                    pretty_time = convert_time_pretty(updated)
                     name = info.get("name")
 
                     if place_id not in last_updates:
                         last_updates[place_id] = updated
+                        daily_update_count[place_id] = 0
                     else:
                         if updated != last_updates[place_id]:
                             last_updates[place_id] = updated
+                            daily_update_count[place_id] += 1
 
-                            embed = discord.Embed(
-                                title=f"{name} UPDATED!",
-                                description=(
-                                    f"**Place ID:** `{place_id}`\n"
-                                    f"**Updated at:** `{pretty_time}`"
-                                ),
-                                color=0xFFD700
+                            msg = (
+                                f"Onett has updated **{name}**\n"
+                                f"Last updated: {convert_to_central(updated)}\n"
+                                f"Updated {daily_update_count[place_id]} times today."
                             )
-                            await channel.send(embed=embed)
+                            await channel.send(msg)
+                except Exception as e:
+                    print("Error fetching game:", e)
+
+            # ---- Group Notifications ----
+            for group_id, group_name in GROUPS.items():
+                try:
+                    members = await fetch_group_members(session, group_id)
+                    last_members = last_group_members.get(group_id, set(members))
+                    new_members = set(members) - last_members
+
+                    # Store updated member list
+                    last_group_members[group_id] = set(members)
+
+                    if group_id == 5211428:  # Testing Group
+                        for _ in new_members:
+                            await channel.send(f"Onett has accepted a new member to **{group_name}**")
+                    elif group_id == 9760527:  # Studio Developer Group
+                        for _ in new_members:
+                            await channel.send(f"Onett has added a new developer to **{group_name}**")
 
                 except Exception as e:
-                    print("Error:", e)
+                    print("Error fetching group members:", e)
 
             await asyncio.sleep(60)
 
 # ------------------------------
-# SLASH COMMAND: /checkupdates
+# Slash command: /checkupdates
 # ------------------------------
-@tree.command(name="checkupdates", description="Show last update time for all monitored Roblox games.")
+@tree.command(name="checkupdates", description="Shows last update time for all monitored Roblox games.")
 async def checkupdates(interaction: discord.Interaction):
-
-    results = []
-
     async with aiohttp.ClientSession() as session:
-        for place_id in GAME_IDS:
+        reply = ""
+        for place_id in GAMES:
             try:
                 universe_id = await fetch_universe_id(session, place_id)
-                if not universe_id:
-                    results.append(f"❌ `{place_id}`: Universe not found\n")
-                    continue
-
                 info = await fetch_game_info(session, universe_id)
-                if not info:
-                    results.append(f"❌ `{place_id}`: Error fetching info\n")
-                    continue
-
-                name = info.get("name")
-                updated = info.get("updated")
-                pretty_time = convert_time_pretty(updated)
-
-                results.append(
-                    f"**{name}**\n"
-                    f"Place ID: `{place_id}`\n"
-                    f"Last Updated: `{pretty_time}`\n"
-                )
-
-            except Exception as e:
-                results.append(f"⚠️ `{place_id}`: {e}\n")
-
-    final_message = "\n".join(results)
-    await interaction.response.send_message(final_message)
+                if info:
+                    updated = info.get("updated")
+                    name = info.get("name")
+                    reply += f"{name}\nLast updated: {convert_to_central(updated)}\n\n"
+                else:
+                    reply += f"{place_id}: Unknown\n\n"
+            except:
+                reply += f"{place_id}: Error fetching info\n\n"
+        await interaction.response.send_message(reply)
 
 # ------------------------------
-# BOT READY
+# Slash command: /checkgroups
+# ------------------------------
+@tree.command(name="checkgroups", description="Shows current member count for all monitored Roblox groups.")
+async def checkgroups(interaction: discord.Interaction):
+    async with aiohttp.ClientSession() as session:
+        reply = ""
+        for group_id, group_name in GROUPS.items():
+            try:
+                info = await fetch_group_info(session, group_id)
+                member_count = info.get("memberCount", "Unknown")
+                reply += f"{group_name}\nTotal Members: {member_count}\n\n"
+            except:
+                reply += f"{group_name}: Error fetching info\n\n"
+        await interaction.response.send_message(reply)
+
+# ------------------------------
+# Bot ready
 # ------------------------------
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
     await tree.sync()
-    asyncio.create_task(check_updates())
+    asyncio.create_task(background_task())
 
 # ------------------------------
-# START KEEP ALIVE + BOT
+# Start keep-alive + bot
 # ------------------------------
 keep_alive()
 client.run(TOKEN)
