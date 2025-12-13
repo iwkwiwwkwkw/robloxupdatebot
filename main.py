@@ -4,41 +4,44 @@ import asyncio
 import aiohttp
 import os
 from keep_alive import keep_alive
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
+# ------------------------------
+# CONFIG
+# ------------------------------
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = 1447166033746989119
 
-# Roblox game place IDs
-GAME_IDS = [
-    3719762683,      # Public Test Realm - Bee Swarm Simulator
-    137594107439804, # Bee Swarm Simulator
-    4079902982,      # Bee Swarm Test Realm
-    17573622029      # buzz
-]
+GAMES = {
+    3719762683: "[Public Test Realm] Bee Swarm Simulator",
+    137594107439804: "Bee Swarm Simulator",
+    4079902982: "Bee Swarm Test Realm ⚠️ READ DESC ⚠️",
+    17573622029: "buzz"
+}
 
-# Roblox test realm group ID
-GROUP_ID = 5211428  # Onett's Testing Group
+CHECK_INTERVAL = 60  # seconds
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+# Store last update times
 last_updates = {}
-group_last_member_count = None
+daily_update_counts = {place_id: 0 for place_id in GAMES}
+
+# Store current day for reset
+central = pytz.timezone("America/Chicago")
+current_day = datetime.now(central).date()
 
 # ------------------------------
-# TIME CONVERSION (UTC → CT, PRETTY)
+# TIME CONVERSION (UTC → Central, Pretty)
 # ------------------------------
 def convert_time_pretty(utc_time):
     if not utc_time:
         return "Unknown"
-
     utc_dt = datetime.fromisoformat(utc_time.replace("Z", "+00:00"))
-    central = pytz.timezone("America/Chicago")
     ct_dt = utc_dt.astimezone(central)
-
     return ct_dt.strftime("%B %d, %Y – %I:%M %p CT")
 
 # ------------------------------
@@ -58,23 +61,24 @@ async def fetch_game_info(session, universe_id):
             return data["data"][0]
         return None
 
-async def fetch_group_members(session, group_id):
-    url = f"https://groups.roblox.com/v1/groups/{group_id}"
-    async with session.get(url) as response:
-        return await response.json()
-
 # ------------------------------
 # BACKGROUND CHECKER
 # ------------------------------
 async def check_updates():
-    global group_last_member_count
+    global current_day, daily_update_counts
+
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
 
     async with aiohttp.ClientSession() as session:
         while not client.is_closed():
-            # Check game updates
-            for place_id in GAME_IDS:
+            # Check if day has changed (reset counters)
+            now = datetime.now(central).date()
+            if now != current_day:
+                current_day = now
+                daily_update_counts = {place_id: 0 for place_id in GAMES}
+
+            for place_id, game_name in GAMES.items():
                 try:
                     universe_id = await fetch_universe_id(session, place_id)
                     if not universe_id:
@@ -86,42 +90,28 @@ async def check_updates():
 
                     updated = info.get("updated")
                     pretty_time = convert_time_pretty(updated)
-                    name = info.get("name")
 
                     if place_id not in last_updates:
                         last_updates[place_id] = updated
                     else:
                         if updated != last_updates[place_id]:
                             last_updates[place_id] = updated
+                            daily_update_counts[place_id] += 1
 
                             embed = discord.Embed(
-                                title=f"{name} has UPDATED!",
+                                title=f"{game_name} has UPDATED!",
                                 description=(
                                     f"Place ID: `{place_id}`\n"
-                                    f"Last Updated: `{pretty_time}`"
-                                ),
-                                color=0xFFFFFF  # white
+                                    f"Last Updated: `{pretty_time}`\n"
+                                    f"Updated today: {daily_update_counts[place_id]} time(s)"
+                                )
                             )
                             await channel.send(embed=embed)
 
                 except Exception as e:
                     print("Error:", e)
 
-            # Check test realm group members
-            try:
-                group_info = await fetch_group_members(session, GROUP_ID)
-                current_member_count = group_info.get("memberCount")
-
-                if group_last_member_count is None:
-                    group_last_member_count = current_member_count
-                elif current_member_count > group_last_member_count:
-                    group_last_member_count = current_member_count
-                    await channel.send("Onett has accepted a new member to the test realm group!")
-
-            except Exception as e:
-                print("Error fetching group:", e)
-
-            await asyncio.sleep(120)  # check every 120 seconds
+            await asyncio.sleep(CHECK_INTERVAL)
 
 # ------------------------------
 # SLASH COMMAND: /checkupdates
@@ -131,28 +121,43 @@ async def checkupdates(interaction: discord.Interaction):
     results = []
 
     async with aiohttp.ClientSession() as session:
-        for place_id in GAME_IDS:
+        for place_id, game_name in GAMES.items():
             try:
                 universe_id = await fetch_universe_id(session, place_id)
-                info = await fetch_game_info(session, universe_id)
+                if not universe_id:
+                    results.append(f"❌ `{place_id}`: Universe not found\n")
+                    continue
 
-                if info:
-                    name = info.get("name")
-                    updated = info.get("updated")
-                    pretty_time = convert_time_pretty(updated)
-                    results.append(
-                        f"**{name}**\n"
-                        f"Place ID: `{place_id}`\n"
-                        f"Last Updated: `{pretty_time}`\n"
-                    )
-                else:
+                info = await fetch_game_info(session, universe_id)
+                if not info:
                     results.append(f"❌ `{place_id}`: Error fetching info\n")
+                    continue
+
+                updated = info.get("updated")
+                pretty_time = convert_time_pretty(updated)
+
+                results.append(
+                    f"**{game_name}**\n"
+                    f"Place ID: `{place_id}`\n"
+                    f"Last Updated: `{pretty_time}`\n"
+                )
 
             except Exception as e:
                 results.append(f"⚠️ `{place_id}`: {e}\n")
 
-    final_message = "\n".join(results)
-    await interaction.response.send_message(final_message)
+    await interaction.response.send_message("\n".join(results))
+
+# ------------------------------
+# SLASH COMMAND: /dailysummary
+# ------------------------------
+@tree.command(name="dailysummary", description="Show how many times each game updated today.")
+async def dailysummary(interaction: discord.Interaction):
+    summary = []
+    for place_id, game_name in GAMES.items():
+        count = daily_update_counts.get(place_id, 0)
+        summary.append(f"**{game_name}** → Updated today: {count} time(s)")
+
+    await interaction.response.send_message("\n".join(summary))
 
 # ------------------------------
 # BOT READY
