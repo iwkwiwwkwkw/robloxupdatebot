@@ -3,82 +3,69 @@ from discord import app_commands
 import asyncio
 import aiohttp
 import os
-from keep_alive import keep_alive
-from datetime import datetime, timedelta
+from datetime import datetime, date
 import pytz
 
-# ------------------------------
-# CONFIG
-# ------------------------------
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = 1447166033746989119
 
-GAMES = {
-    3719762683: "[Public Test Realm] Bee Swarm Simulator",
+GAME_IDS = {
+    3719762683: "Public Test Realm – Bee Swarm Simulator",
     137594107439804: "Bee Swarm Simulator",
     4079902982: "Bee Swarm Test Realm ⚠️ READ DESC ⚠️",
     17573622029: "buzz"
 }
 
-CHECK_INTERVAL = 60  # seconds
+CHECK_INTERVAL = 120  # seconds
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Store last update times
-last_updates = {}
-daily_update_counts = {place_id: 0 for place_id in GAMES}
-
-# Store current day for reset
 central = pytz.timezone("America/Chicago")
-current_day = datetime.now(central).date()
+
+last_update_time = {}
+daily_update_count = {}
+last_notification_date = {}
 
 # ------------------------------
-# TIME CONVERSION (UTC → Central, Pretty)
+# TIME FORMAT
 # ------------------------------
-def convert_time_pretty(utc_time):
-    if not utc_time:
-        return "Unknown"
+def pretty_time(utc_time):
     utc_dt = datetime.fromisoformat(utc_time.replace("Z", "+00:00"))
     ct_dt = utc_dt.astimezone(central)
-    return ct_dt.strftime("%B %d, %Y – %I:%M %p CT")
+    return ct_dt.strftime("%A, %B %d, %Y at %I:%M %p CT")
+
+def today_ct():
+    return datetime.now(central).date()
 
 # ------------------------------
-# API FUNCTIONS
+# ROBLOX API
 # ------------------------------
 async def fetch_universe_id(session, place_id):
     url = f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
-    async with session.get(url) as response:
-        data = await response.json()
+    async with session.get(url) as r:
+        data = await r.json()
         return data.get("universeId")
 
 async def fetch_game_info(session, universe_id):
     url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
-    async with session.get(url) as response:
-        data = await response.json()
-        if "data" in data and len(data["data"]) > 0:
+    async with session.get(url) as r:
+        data = await r.json()
+        if data.get("data"):
             return data["data"][0]
         return None
 
 # ------------------------------
-# BACKGROUND CHECKER
+# BACKGROUND TASK
 # ------------------------------
 async def check_updates():
-    global current_day, daily_update_counts
-
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
 
     async with aiohttp.ClientSession() as session:
         while not client.is_closed():
-            # Check if day has changed (reset counters)
-            now = datetime.now(central).date()
-            if now != current_day:
-                current_day = now
-                daily_update_counts = {place_id: 0 for place_id in GAMES}
-
-            for place_id, game_name in GAMES.items():
+            for place_id, display_name in GAME_IDS.items():
                 try:
                     universe_id = await fetch_universe_id(session, place_id)
                     if not universe_id:
@@ -88,25 +75,33 @@ async def check_updates():
                     if not info:
                         continue
 
-                    updated = info.get("updated")
-                    pretty_time = convert_time_pretty(updated)
+                    updated = info["updated"]
+                    today = today_ct()
 
-                    if place_id not in last_updates:
-                        last_updates[place_id] = updated
-                    else:
-                        if updated != last_updates[place_id]:
-                            last_updates[place_id] = updated
-                            daily_update_counts[place_id] += 1
+                    if place_id not in last_update_time:
+                        last_update_time[place_id] = updated
+                        daily_update_count[place_id] = 0
+                        last_notification_date[place_id] = None
+                        continue
 
-                            embed = discord.Embed(
-                                title=f"{game_name} has UPDATED!",
-                                description=(
-                                    f"Place ID: `{place_id}`\n"
-                                    f"Last Updated: `{pretty_time}`\n"
-                                    f"Updated today: {daily_update_counts[place_id]} time(s)"
-                                )
+                    if updated != last_update_time[place_id]:
+                        last_update_time[place_id] = updated
+
+                        # reset daily count if new day
+                        if last_notification_date.get(place_id) != today:
+                            daily_update_count[place_id] = 0
+                            last_notification_date[place_id] = today
+
+                        daily_update_count[place_id] += 1
+
+                        # send ONLY first notification of the day
+                        if daily_update_count[place_id] == 1:
+                            message = (
+                                f"{display_name} has updated!\n\n"
+                                f"Last updated: {pretty_time(updated)}\n"
+                                f"Updated {daily_update_count[place_id]} times today (since 12:00 AM CT)"
                             )
-                            await channel.send(embed=embed)
+                            await channel.send(message)
 
                 except Exception as e:
                     print("Error:", e)
@@ -114,53 +109,35 @@ async def check_updates():
             await asyncio.sleep(CHECK_INTERVAL)
 
 # ------------------------------
-# SLASH COMMAND: /checkupdates
+# SLASH COMMAND
 # ------------------------------
-@tree.command(name="checkupdates", description="Show last update time for all monitored Roblox games.")
+@tree.command(name="checkupdates", description="Show last update info for all monitored games.")
 async def checkupdates(interaction: discord.Interaction):
-    results = []
+    lines = []
 
     async with aiohttp.ClientSession() as session:
-        for place_id, game_name in GAMES.items():
-            try:
-                universe_id = await fetch_universe_id(session, place_id)
-                if not universe_id:
-                    results.append(f"❌ `{place_id}`: Universe not found\n")
-                    continue
+        for place_id, display_name in GAME_IDS.items():
+            universe_id = await fetch_universe_id(session, place_id)
+            if not universe_id:
+                continue
 
-                info = await fetch_game_info(session, universe_id)
-                if not info:
-                    results.append(f"❌ `{place_id}`: Error fetching info\n")
-                    continue
+            info = await fetch_game_info(session, universe_id)
+            if not info:
+                continue
 
-                updated = info.get("updated")
-                pretty_time = convert_time_pretty(updated)
+            updated = info["updated"]
+            count = daily_update_count.get(place_id, 0)
 
-                results.append(
-                    f"**{game_name}**\n"
-                    f"Place ID: `{place_id}`\n"
-                    f"Last Updated: `{pretty_time}`\n"
-                )
+            lines.append(
+                f"**{display_name}**\n"
+                f"Last updated: {pretty_time(updated)}\n"
+                f"Updates today: {count}\n"
+            )
 
-            except Exception as e:
-                results.append(f"⚠️ `{place_id}`: {e}\n")
-
-    await interaction.response.send_message("\n".join(results))
+    await interaction.response.send_message("\n".join(lines))
 
 # ------------------------------
-# SLASH COMMAND: /dailysummary
-# ------------------------------
-@tree.command(name="dailysummary", description="Show how many times each game updated today.")
-async def dailysummary(interaction: discord.Interaction):
-    summary = []
-    for place_id, game_name in GAMES.items():
-        count = daily_update_counts.get(place_id, 0)
-        summary.append(f"**{game_name}** → Updated today: {count} time(s)")
-
-    await interaction.response.send_message("\n".join(summary))
-
-# ------------------------------
-# BOT READY
+# READY
 # ------------------------------
 @client.event
 async def on_ready():
@@ -168,8 +145,4 @@ async def on_ready():
     await tree.sync()
     asyncio.create_task(check_updates())
 
-# ------------------------------
-# START KEEP ALIVE + BOT
-# ------------------------------
-keep_alive()
 client.run(TOKEN)
